@@ -1,6 +1,6 @@
 # `destroy` *target*...
 
-!!! warning
+!!! danger
 
     The `destroy` command permanently removes files both from your home directory and chezmoi's source directory.
 
@@ -12,10 +12,12 @@
 
 Remove *target* from the source state, the destination directory, and the state.
 
-## `-f`, `--force`
+## Common flags
+
+### `--force`
 
 Destroy without prompting.
 
-## `-r`, `--recursive`
+### `-r`, `--recursive`
 
 Recurse into subdirectories.
