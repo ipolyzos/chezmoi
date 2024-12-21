@@ -4,9 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"sort"
-
-	"github.com/twpayne/chezmoi/v2/internal/chezmoimaps"
+	"maps"
+	"slices"
 )
 
 // A sourceStateEntryTreeNode is a node in a tree of SourceStateEntries.
@@ -67,8 +66,8 @@ func (n *sourceStateEntryTreeNode) forEachNode(targetRelPath RelPath, f func(Rel
 		return err
 	}
 
-	childrenByRelPath := RelPaths(chezmoimaps.Keys(n.children))
-	sort.Sort(childrenByRelPath)
+	childrenByRelPath := slices.Collect(maps.Keys(n.children))
+	slices.SortFunc(childrenByRelPath, CompareRelPaths)
 	for _, childRelPath := range childrenByRelPath {
 		child := n.children[childRelPath]
 		if err := child.forEachNode(targetRelPath.Join(childRelPath), f); err != nil {

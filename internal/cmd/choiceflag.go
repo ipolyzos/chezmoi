@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -12,7 +14,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/twpayne/chezmoi/v2/internal/chezmoi"
-	"github.com/twpayne/chezmoi/v2/internal/chezmoimaps"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoiset"
 )
 
@@ -45,7 +46,7 @@ func newChoiceFlag(value string, allowedValues []string) *choiceFlag {
 
 // FlagCompletionFunc returns f's flag completion function.
 func (f *choiceFlag) FlagCompletionFunc() func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
-	return chezmoi.FlagCompletionFunc(chezmoimaps.SortedKeys(f.allowedValues))
+	return chezmoi.FlagCompletionFunc(slices.Sorted(maps.Keys(f.allowedValues)))
 }
 
 // MarshalJSON implements encoding/json.Marshaler.MarshalJSON.
@@ -60,6 +61,16 @@ func (f *choiceFlag) MarshalText() ([]byte, error) {
 
 // Set implements github.com/spf13/pflag.Value.Set.
 func (f *choiceFlag) Set(s string) error {
+	// If uniqueAbbreviations is nil then all values are allowed. This
+	// functionality, although counter-intuitive, is required because the unique
+	// abbreviations are carried in the value, not in the type, so a
+	// serialization/deserialization round trip discards the unique
+	// abbreviations. To allow deserialization to succeed, we must allow all
+	// values.
+	if f.uniqueAbbreviations == nil {
+		f.value = s
+		return nil
+	}
 	value, ok := f.uniqueAbbreviations[s]
 	if !ok {
 		return errors.New("invalid value")
@@ -74,7 +85,7 @@ func (f *choiceFlag) String() string {
 
 // Type implements github.com/spf13/pflag.Value.Type.
 func (f *choiceFlag) Type() string {
-	sortedKeys := chezmoimaps.SortedKeys(f.allowedValues)
+	sortedKeys := slices.Sorted(maps.Keys(f.allowedValues))
 	if len(sortedKeys) > 0 && sortedKeys[0] == "" {
 		sortedKeys[0] = "<none>"
 	}

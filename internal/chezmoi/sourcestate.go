@@ -5,6 +5,7 @@ package chezmoi
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +24,6 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,7 +35,6 @@ import (
 
 	"github.com/twpayne/chezmoi/v2/internal/chezmoierrors"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoilog"
-	"github.com/twpayne/chezmoi/v2/internal/chezmoimaps"
 	"github.com/twpayne/chezmoi/v2/internal/chezmoiset"
 )
 
@@ -87,6 +87,9 @@ type externalPull struct {
 	Args []string `json:"args" toml:"args" yaml:"args"`
 }
 
+// A WarnFunc is a function that warns the user.
+type WarnFunc func(string, ...any)
+
 // An External is an external source.
 type External struct {
 	Type            ExternalType      `json:"type"            toml:"type"            yaml:"type"`
@@ -108,6 +111,7 @@ type External struct {
 	RefreshPeriod   Duration          `json:"refreshPeriod"   toml:"refreshPeriod"   yaml:"refreshPeriod"`
 	StripComponents int               `json:"stripComponents" toml:"stripComponents" yaml:"stripComponents"`
 	URL             string            `json:"url"             toml:"url"             yaml:"url"`
+	URLs            []string          `json:"urls"            toml:"urls"            yaml:"urls"`
 	sourceAbsPath   AbsPath
 }
 
@@ -145,6 +149,7 @@ type SourceState struct {
 	templates               map[string]*Template
 	externals               map[RelPath][]*External
 	ignoredRelPaths         chezmoiset.Set[RelPath]
+	warnFunc                WarnFunc
 }
 
 // A SourceStateOption sets an option on a source state.
@@ -290,6 +295,13 @@ func WithVersion(version semver.Version) SourceStateOption {
 	}
 }
 
+// WithWarnFunc sets the warning function.
+func WithWarnFunc(warnFunc WarnFunc) SourceStateOption {
+	return func(s *SourceState) {
+		s.warnFunc = warnFunc
+	}
+}
+
 // A targetStateEntryFunc returns a TargetStateEntry based on reading an AbsPath
 // on a System.
 type targetStateEntryFunc func(System, AbsPath) (TargetStateEntry, error)
@@ -353,8 +365,7 @@ func (s *SourceState) Add(
 	options *AddOptions,
 ) error {
 	// Filter out excluded and ignored paths.
-	destAbsPaths := AbsPaths(chezmoimaps.Keys(destAbsPathInfos))
-	sort.Sort(destAbsPaths)
+	destAbsPaths := slices.Sorted(maps.Keys(destAbsPathInfos))
 	n := 0
 	for _, destAbsPath := range destAbsPaths {
 		destAbsPathInfo := destAbsPathInfos[destAbsPath]
@@ -622,14 +633,8 @@ DEST_ABS_PATH:
 	// Rename directories last because updates assume that directory names have
 	// not changed. Rename directories in reverse order so children are renamed
 	// before their parents.
-	oldDirAbsPaths := make([]AbsPath, 0, len(dirRenames))
-	for oldDirAbsPath := range dirRenames {
-		oldDirAbsPaths = append(oldDirAbsPaths, oldDirAbsPath)
-	}
-	sort.Slice(oldDirAbsPaths, func(i, j int) bool {
-		return oldDirAbsPaths[j].Less(oldDirAbsPaths[i])
-	})
-	for _, oldDirAbsPath := range oldDirAbsPaths {
+	oldDirAbsPaths := slices.Sorted(maps.Keys(dirRenames))
+	for _, oldDirAbsPath := range slices.Backward(oldDirAbsPaths) {
 		newDirAbsPath := dirRenames[oldDirAbsPath]
 		if err := sourceSystem.Rename(oldDirAbsPath, newDirAbsPath); err != nil {
 			return err
@@ -841,9 +846,9 @@ func (s *SourceState) Ignore(targetRelPath RelPath) bool {
 }
 
 // Ignored returns all ignored RelPaths.
-func (s *SourceState) Ignored() RelPaths {
-	relPaths := RelPaths(s.ignoredRelPaths.Elements())
-	sort.Sort(relPaths)
+func (s *SourceState) Ignored() []RelPath {
+	relPaths := s.ignoredRelPaths.Elements()
+	slices.SortFunc(relPaths, CompareRelPaths)
 	return relPaths
 }
 
@@ -862,7 +867,7 @@ func (s *SourceState) PostApply(
 	targetSystem System,
 	persistentState PersistentState,
 	targetDirAbsPath AbsPath,
-	targetRelPaths RelPaths,
+	targetRelPaths []RelPath,
 ) error {
 	// Remove empty directories with the remove_ attribute. This assumes that
 	// targetRelPaths is already sorted and iterates in reverse order so that
@@ -1067,11 +1072,11 @@ func (s *SourceState) Read(ctx context.Context, options *ReadOptions) error {
 	}
 
 	// Read externals.
-	externalRelPaths := make(RelPaths, 0, len(s.externals))
+	externalRelPaths := make([]RelPath, 0, len(s.externals))
 	for externalRelPath := range s.externals {
 		externalRelPaths = append(externalRelPaths, externalRelPath)
 	}
-	sort.Sort(externalRelPaths)
+	slices.SortFunc(externalRelPaths, CompareRelPaths)
 	for _, externalRelPath := range externalRelPaths {
 		if s.Ignore(externalRelPath) {
 			continue
@@ -1176,7 +1181,7 @@ func (s *SourceState) Read(ctx context.Context, options *ReadOptions) error {
 	}
 
 	// Generate SourceStateCommands for git-repo externals.
-	var gitRepoExternalRelPaths RelPaths
+	var gitRepoExternalRelPaths []RelPath
 	for externalRelPath, externals := range s.externals {
 		if s.Ignore(externalRelPath) {
 			continue
@@ -1187,7 +1192,7 @@ func (s *SourceState) Read(ctx context.Context, options *ReadOptions) error {
 			}
 		}
 	}
-	sort.Sort(gitRepoExternalRelPaths)
+	slices.SortFunc(gitRepoExternalRelPaths, CompareRelPaths)
 	for _, externalRelPath := range gitRepoExternalRelPaths {
 		for _, external := range s.externals[externalRelPath] {
 			destAbsPath := s.destDirAbsPath.Join(externalRelPath)
@@ -1252,11 +1257,11 @@ func (s *SourceState) Read(ctx context.Context, options *ReadOptions) error {
 
 	// Check for inconsistent source entries. Iterate over the target names in
 	// order so that any error is deterministic.
-	targetRelPaths := make(RelPaths, 0, len(allSourceStateEntries))
+	targetRelPaths := make([]RelPath, 0, len(allSourceStateEntries))
 	for targetRelPath := range allSourceStateEntries {
 		targetRelPaths = append(targetRelPaths, targetRelPath)
 	}
-	sort.Sort(targetRelPaths)
+	slices.SortFunc(targetRelPaths, CompareRelPaths)
 	errs := make([]error, 0, len(targetRelPaths))
 	for _, targetRelPath := range targetRelPaths {
 		sourceStateEntries := allSourceStateEntries[targetRelPath]
@@ -1264,11 +1269,11 @@ func (s *SourceState) Read(ctx context.Context, options *ReadOptions) error {
 			continue
 		}
 
-		origins := make([]string, 0, len(sourceStateEntries))
-		for _, sourceStateEntry := range sourceStateEntries {
-			origins = append(origins, sourceStateEntry.Origin().OriginString())
+		origins := make([]string, len(sourceStateEntries))
+		for i, sourceStateEntry := range sourceStateEntries {
+			origins[i] = sourceStateEntry.Origin().OriginString()
 		}
-		sort.Strings(origins)
+		slices.Sort(origins)
 		errs = append(errs, &inconsistentStateError{
 			targetRelPath: targetRelPath,
 			origins:       origins,
@@ -1293,17 +1298,11 @@ func (s *SourceState) TargetRelPaths() []RelPath {
 	for targetRelPath := range entries {
 		targetRelPaths = append(targetRelPaths, targetRelPath)
 	}
-	sort.Slice(targetRelPaths, func(i, j int) bool {
-		orderI := entries[targetRelPaths[i]].Order()
-		orderJ := entries[targetRelPaths[j]].Order()
-		switch {
-		case orderI < orderJ:
-			return true
-		case orderI == orderJ:
-			return targetRelPaths[i].Less(targetRelPaths[j])
-		default:
-			return false
+	slices.SortFunc(targetRelPaths, func(a, b RelPath) int {
+		if compare := cmp.Compare(entries[a].Order(), entries[b].Order()); compare != 0 {
+			return compare
 		}
+		return CompareRelPaths(a, b)
 	})
 	return targetRelPaths
 }
@@ -1354,8 +1353,19 @@ func (s *SourceState) addExternal(sourceAbsPath, parentAbsPath AbsPath) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	for path, external := range externals {
-		if strings.HasPrefix(path, "/") || filepath.IsAbs(path) {
+		switch {
+		case path == "":
+			return fmt.Errorf("%s: empty path", sourceAbsPath)
+		case strings.HasPrefix(path, "/") || filepath.IsAbs(path):
 			return fmt.Errorf("%s: %s: path is not relative", sourceAbsPath, path)
+		}
+		switch relPath, err := filepath.Rel(".", path); {
+		case err != nil:
+			return fmt.Errorf("%s: %s: %w", sourceAbsPath, path, err)
+		case relPath == ".":
+			return fmt.Errorf("%s: %s: empty relative path", sourceAbsPath, path)
+		case relPath == "..", strings.HasPrefix(relPath, "../"):
+			return fmt.Errorf("%s: %s: relative path in parent", sourceAbsPath, path)
 		}
 		targetRelPath := parentTargetSourceRelPath.JoinString(path)
 		external.sourceAbsPath = sourceAbsPath
@@ -1459,7 +1469,7 @@ func (s *SourceState) addTemplateData(sourceAbsPath AbsPath) error {
 	return nil
 }
 
-// addTemplateData adds all template data in the directory sourceAbsPath to s.
+// addTemplateDataDir adds all template data in the directory sourceAbsPath to s.
 func (s *SourceState) addTemplateDataDir(sourceAbsPath AbsPath, fileInfo fs.FileInfo) error {
 	walkFunc := func(dataAbsPath AbsPath, fileInfo fs.FileInfo, err error) error {
 		if dataAbsPath == sourceAbsPath {
@@ -1558,11 +1568,12 @@ func (s *SourceState) executeTemplate(templateAbsPath AbsPath) ([]byte, error) {
 func (s *SourceState) getExternalDataRaw(
 	ctx context.Context,
 	externalRelPath RelPath,
-	external *External,
+	urlStr string,
+	refreshPeriod Duration,
 	options *ReadOptions,
 ) ([]byte, error) {
 	// Handle file:// URLs by always reading from disk.
-	switch urlStruct, err := url.Parse(external.URL); {
+	switch urlStruct, err := url.Parse(urlStr); {
 	case err != nil:
 		return nil, err
 	case urlStruct.Scheme == "file":
@@ -1585,7 +1596,7 @@ func (s *SourceState) getExternalDataRaw(
 	if options != nil {
 		refreshExternals = options.RefreshExternals
 	}
-	urlSHA256 := sha256.Sum256([]byte(external.URL))
+	urlSHA256 := sha256.Sum256([]byte(urlStr))
 	cacheKey := hex.EncodeToString(urlSHA256[:])
 	cachedDataAbsPath := s.cacheDirAbsPath.JoinString("external", cacheKey)
 	switch refreshExternals {
@@ -1594,7 +1605,7 @@ func (s *SourceState) getExternalDataRaw(
 	case RefreshExternalsAuto:
 		// Use the cache, if available and within the refresh period.
 		if fileInfo, err := s.baseSystem.Stat(cachedDataAbsPath); err == nil {
-			if external.RefreshPeriod == 0 || fileInfo.ModTime().Add(time.Duration(external.RefreshPeriod)).After(now) {
+			if refreshPeriod == 0 || fileInfo.ModTime().Add(time.Duration(refreshPeriod)).After(now) {
 				if data, err := s.baseSystem.ReadFile(cachedDataAbsPath); err == nil {
 					return data, nil
 				}
@@ -1608,7 +1619,7 @@ func (s *SourceState) getExternalDataRaw(
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, external.URL, http.NoBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -1627,7 +1638,7 @@ func (s *SourceState) getExternalDataRaw(
 		return nil, err
 	}
 	if resp.StatusCode < http.StatusOK || http.StatusMultipleChoices <= resp.StatusCode {
-		return nil, fmt.Errorf("%s: %s: %s", externalRelPath, external.URL, resp.Status)
+		return nil, fmt.Errorf("%s: %s: %s", externalRelPath, urlStr, resp.Status)
 	}
 
 	if err := MkdirAll(s.baseSystem, cachedDataAbsPath.Dir(), 0o700); err != nil {
@@ -1643,22 +1654,54 @@ func (s *SourceState) getExternalDataRaw(
 	return data, nil
 }
 
+// getExternalDataAndURL iterates over external.URL and external.URLs, returning
+// the first data that is downloaded successfully and the URL it was downloaded
+// from.
+func (s *SourceState) getExternalDataAndURL(
+	ctx context.Context,
+	externalRelPath RelPath,
+	external *External,
+	options *ReadOptions,
+) ([]byte, string, error) {
+	var firstURLStr string
+	var firstErr error
+	for _, urlStr := range append([]string{external.URL}, external.URLs...) {
+		if urlStr == "" {
+			continue
+		}
+		data, err := s.getExternalDataRaw(ctx, externalRelPath, urlStr, external.RefreshPeriod, options)
+		if err == nil {
+			return data, urlStr, nil
+		}
+		if firstURLStr == "" {
+			firstURLStr = urlStr
+			firstErr = err
+		}
+	}
+	if firstURLStr == "" {
+		return nil, "", fmt.Errorf("%s: no URL", externalRelPath)
+	}
+	return nil, firstURLStr, firstErr
+}
+
 // getExternalData reads the external data for externalRelPath from
-// external.URL.
+// external.URL or external.URLs, returning the data and URL.
 func (s *SourceState) getExternalData(
 	ctx context.Context,
 	externalRelPath RelPath,
 	external *External,
 	options *ReadOptions,
-) ([]byte, error) {
-	data, err := s.getExternalDataRaw(ctx, externalRelPath, external, options)
+) ([]byte, string, error) {
+	data, urlStr, err := s.getExternalDataAndURL(ctx, externalRelPath, external, options)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var errs []error
 
-	if external.Checksum.Size != 0 {
+	if external.Checksum.Size != 0 && external.Checksum.SHA256 == nil && external.Checksum.SHA384 == nil &&
+		external.Checksum.SHA512 == nil {
+		s.warnFunc("%s: warning: insecure size check without secure hash will be removed\n", externalRelPath)
 		if len(data) != external.Checksum.Size {
 			err := fmt.Errorf("size mismatch: expected %d, got %d", external.Checksum.Size, len(data))
 			errs = append(errs, err)
@@ -1666,6 +1709,10 @@ func (s *SourceState) getExternalData(
 	}
 
 	if external.Checksum.MD5 != nil {
+		s.warnFunc(
+			"%s: warning: insecure MD5 checksum will be removed, use a secure hash like SHA256 instead\n",
+			externalRelPath,
+		)
 		if gotMD5Sum := md5Sum(data); !bytes.Equal(gotMD5Sum, external.Checksum.MD5) {
 			err := fmt.Errorf("MD5 mismatch: expected %s, got %s", external.Checksum.MD5, hex.EncodeToString(gotMD5Sum))
 			errs = append(errs, err)
@@ -1673,6 +1720,10 @@ func (s *SourceState) getExternalData(
 	}
 
 	if external.Checksum.RIPEMD160 != nil {
+		s.warnFunc(
+			"%s: warning: insecure RIPEMD-160 checksum will be removed, use a secure hash like SHA256 instead\n",
+			externalRelPath,
+		)
 		if gotRIPEMD160Sum := ripemd160Sum(data); !bytes.Equal(gotRIPEMD160Sum, external.Checksum.RIPEMD160) {
 			format := "RIPEMD-160 mismatch: expected %s, got %s"
 			err := fmt.Errorf(format, external.Checksum.RIPEMD160, hex.EncodeToString(gotRIPEMD160Sum))
@@ -1681,6 +1732,10 @@ func (s *SourceState) getExternalData(
 	}
 
 	if external.Checksum.SHA1 != nil {
+		s.warnFunc(
+			"%s: warning: insecure SHA1 checksum will be removed, use a secure hash like SHA256 instead\n",
+			externalRelPath,
+		)
 		if gotSHA1Sum := sha1Sum(data); !bytes.Equal(gotSHA1Sum, external.Checksum.SHA1) {
 			err := fmt.Errorf("SHA1 mismatch: expected %s, got %s", external.Checksum.SHA1, hex.EncodeToString(gotSHA1Sum))
 			errs = append(errs, err)
@@ -1710,19 +1765,19 @@ func (s *SourceState) getExternalData(
 	}
 
 	if len(errs) != 0 {
-		return nil, fmt.Errorf("%s: %w", externalRelPath, errors.Join(errs...))
+		return nil, urlStr, fmt.Errorf("%s: %w", externalRelPath, errors.Join(errs...))
 	}
 
 	if external.Encrypted {
 		data, err = s.encryption.Decrypt(data)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %s: %w", externalRelPath, external.URL, err)
+			return nil, urlStr, fmt.Errorf("%s: %s: %w", externalRelPath, urlStr, err)
 		}
 	}
 
 	data, err = decompress(external.Decompress, data)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", externalRelPath, err)
+		return nil, urlStr, fmt.Errorf("%s: %w", externalRelPath, err)
 	}
 
 	if external.Filter.Command != "" {
@@ -1731,11 +1786,11 @@ func (s *SourceState) getExternalData(
 		cmd.Stderr = os.Stderr
 		data, err = chezmoilog.LogCmdOutput(s.logger, cmd)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %s: %w", externalRelPath, external.URL, err)
+			return nil, urlStr, fmt.Errorf("%s: %s: %w", externalRelPath, urlStr, err)
 		}
 	}
 
-	return data, nil
+	return data, urlStr, nil
 }
 
 // newSourceStateDir returns a new SourceStateDir.
@@ -2312,7 +2367,7 @@ func (s *SourceState) readExternalArchive(
 	external *External,
 	options *ReadOptions,
 ) (map[RelPath][]SourceStateEntry, error) {
-	data, format, err := s.readExternalArchiveData(ctx, externalRelPath, external, options)
+	data, urlStr, format, err := s.readExternalArchiveData(ctx, externalRelPath, external, options)
 	if err != nil {
 		return nil, err
 	}
@@ -2470,7 +2525,7 @@ func (s *SourceState) readExternalArchive(
 		sourceStateEntries[targetRelPath] = append(sourceStateEntries[targetRelPath], sourceStateEntry)
 		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("%s: %s: %w", externalRelPath, external.URL, err)
+		return nil, fmt.Errorf("%s: %s: %w", externalRelPath, urlStr, err)
 	}
 
 	return s.populateImplicitParentDirs(externalRelPath, external, sourceStateEntries), nil
@@ -2483,16 +2538,16 @@ func (s *SourceState) readExternalArchiveData(
 	externalRelPath RelPath,
 	external *External,
 	options *ReadOptions,
-) ([]byte, ArchiveFormat, error) {
-	data, err := s.getExternalData(ctx, externalRelPath, external, options)
+) ([]byte, string, ArchiveFormat, error) {
+	data, urlStr, err := s.getExternalData(ctx, externalRelPath, external, options)
 	if err != nil {
-		return nil, ArchiveFormatUnknown, err
+		return nil, "", ArchiveFormatUnknown, err
 	}
 
-	externalURL, err := url.Parse(external.URL)
+	externalURL, err := url.Parse(urlStr)
 	if err != nil {
-		err := fmt.Errorf("%s: %s: %w", externalRelPath, external.URL, err)
-		return nil, ArchiveFormatUnknown, err
+		err := fmt.Errorf("%s: %s: %w", externalRelPath, urlStr, err)
+		return nil, urlStr, ArchiveFormatUnknown, err
 	}
 	urlPath := externalURL.Path
 	if external.Encrypted {
@@ -2504,7 +2559,7 @@ func (s *SourceState) readExternalArchiveData(
 		format = GuessArchiveFormat(urlPath, data)
 	}
 
-	return data, format, nil
+	return data, urlStr, format, nil
 }
 
 // readExternalArchiveFile reads a file from an external archive and returns its
@@ -2520,7 +2575,7 @@ func (s *SourceState) readExternalArchiveFile(
 		return nil, fmt.Errorf("%s: missing path", externalRelPath)
 	}
 
-	data, format, err := s.readExternalArchiveData(ctx, externalRelPath, external, options)
+	data, urlStr, format, err := s.readExternalArchiveData(ctx, externalRelPath, external, options)
 	if err != nil {
 		return nil, err
 	}
@@ -2611,7 +2666,7 @@ func (s *SourceState) readExternalArchiveFile(
 		return nil, err
 	}
 	if sourceStateEntry == nil {
-		return nil, fmt.Errorf("%s: path not found in %s", external.ArchivePath, external.URL)
+		return nil, fmt.Errorf("%s: path not found in %s", external.ArchivePath, urlStr)
 	}
 
 	return s.populateImplicitParentDirs(externalRelPath, external, map[RelPath][]SourceStateEntry{
@@ -2619,7 +2674,7 @@ func (s *SourceState) readExternalArchiveFile(
 	}), nil
 }
 
-// ReadExternalDir returns all source state entries in an external_ dir.
+// readExternalDir returns all source state entries in an external_ dir.
 func (s *SourceState) readExternalDir(
 	rootSourceAbsPath AbsPath,
 	rootSourceRelPath SourceRelPath,
@@ -2728,7 +2783,8 @@ func (s *SourceState) readExternalFile(
 	options *ReadOptions,
 ) (map[RelPath][]SourceStateEntry, error) {
 	contentsFunc := sync.OnceValues(func() ([]byte, error) {
-		return s.getExternalData(ctx, externalRelPath, external, options)
+		data, _, err := s.getExternalData(ctx, externalRelPath, external, options)
+		return data, err
 	})
 	fileAttr := FileAttr{
 		Empty:      true,
@@ -2880,7 +2936,8 @@ func (e *External) Path() AbsPath {
 }
 
 func (e *External) OriginString() string {
-	return e.URL + " defined in " + e.sourceAbsPath.String()
+	urlStr := cmp.Or(append([]string{e.URL}, e.URLs...)...)
+	return urlStr + " defined in " + e.sourceAbsPath.String()
 }
 
 // canonicalSourceStateEntry returns the canonical SourceStateEntry for the

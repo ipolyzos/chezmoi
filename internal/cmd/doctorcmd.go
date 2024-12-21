@@ -14,13 +14,13 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/coreos/go-semver/semver"
-	"github.com/google/go-github/v66/github"
+	"github.com/google/go-github/v67/github"
 	"github.com/spf13/cobra"
 	"github.com/twpayne/go-shell"
 	"github.com/twpayne/go-xdg/v6"
@@ -564,7 +564,7 @@ func (c *configFileCheck) Run(system chezmoi.System, homeDirAbsPath chezmoi.AbsP
 		for filenameAbsPath := range filenameAbsPaths {
 			filenameStrs = append(filenameStrs, filenameAbsPath.String())
 		}
-		sort.Strings(filenameStrs)
+		slices.Sort(filenameStrs)
 		return checkResultWarning, englishList(filenameStrs) + ": multiple config files"
 	}
 }
